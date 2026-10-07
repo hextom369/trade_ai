@@ -20,6 +20,7 @@ class StrategyConfig:
     quality_gate: bool = True    # scale exposure by the model's recent live hit rate
     gate_window: int = 120
     periods_per_year: int = 252
+    rebalance_band: float = 0.0  # keep the current position unless the target moves more than this
 
 
 def positions_from_proba(proba: pd.Series, close: pd.Series,
@@ -39,6 +40,17 @@ def positions_from_proba(proba: pd.Series, close: pd.Series,
     span = max(cfg.full_edge - band, 1e-9)
     conviction = np.sign(edge) * ((edge.abs() - band) / span).clip(0, 1)
     conviction = conviction.fillna(0.0)
+    return size_positions(conviction, close, cfg)
+
+
+def size_positions(conviction: pd.Series, close: pd.Series,
+                   cfg: StrategyConfig | None = None) -> pd.Series:
+    """Turn a conviction in [-1, 1] into a position with smoothing and vol targeting.
+
+    Shared by the ML strategy and the rule-based strategies.
+    """
+    cfg = cfg or StrategyConfig()
+    conviction = conviction.reindex(close.index).fillna(0.0).clip(-1, 1)
     if cfg.long_only:
         conviction = conviction.clip(lower=0)
     if cfg.smoothing and cfg.smoothing > 1:
@@ -50,7 +62,25 @@ def positions_from_proba(proba: pd.Series, close: pd.Series,
         pos = conviction * scale
     else:
         pos = conviction
-    return pos.clip(-cfg.max_leverage, cfg.max_leverage).rename("position")
+    pos = pos.clip(-cfg.max_leverage, cfg.max_leverage)
+    if cfg.rebalance_band:
+        pos = apply_rebalance_band(pos, cfg.rebalance_band)
+    return pos.rename("position")
+
+
+def apply_rebalance_band(target: pd.Series, band: float) -> pd.Series:
+    """Hysteresis: only move to a new target when it differs from the held one by > ``band``.
+
+    Mirrors the live trader, which skips orders smaller than its rebalance band;
+    going flat (target 0) is always executed.
+    """
+    out = np.empty(len(target))
+    held = 0.0
+    for i, t in enumerate(target.to_numpy()):
+        if (t == 0.0 and held != 0.0) or abs(t - held) > band:
+            held = t
+        out[i] = held
+    return pd.Series(out, index=target.index)
 
 
 def quality_gate(proba: pd.Series, labels: pd.Series, horizon: int,

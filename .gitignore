@@ -8,3 +8,4 @@ dist/
 data/
 *.csv
 !tests/fixtures/*.csv
+trade_state/
