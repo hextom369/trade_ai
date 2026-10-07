@@ -16,3 +16,4 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: pytest -q
       - run: python -m trade_ai backtest --synthetic --horizon 1
+      - run: python -m trade_ai topstep backtest --days 120 --synthetic-trend 1

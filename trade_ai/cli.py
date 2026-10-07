@@ -5,6 +5,7 @@ Examples:
     python -m trade_ai backtest --csv prices.csv --long-only
     python -m trade_ai backtest --ticker SPY --start 2010-01-01
     python -m trade_ai signal --ticker 7203.T
+    python -m trade_ai topstep backtest --csv mes_1m.csv
 """
 
 from __future__ import annotations
@@ -78,6 +79,12 @@ def _config(args) -> PipelineConfig:
 
 
 def main(argv: list[str] | None = None) -> int:
+    import sys
+
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "topstep":
+        from .topstep.cli import main as topstep_main
+        return topstep_main(argv[1:])
     parser = argparse.ArgumentParser(prog="trade_ai")
     sub = parser.add_subparsers(dest="command", required=True)
     bt = sub.add_parser("backtest", help="walk-forward backtest")
