@@ -86,6 +86,9 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--target-vol", type=float, default=0.15)
     p.add_argument("--max-leverage", type=float, default=1.0)
     p.add_argument("--smoothing", type=int, default=3)
+    p.add_argument("--band", type=float, default=0.0,
+                   help="backtest: ignore target changes smaller than this (like the live "
+                        "--rebalance-band)")
     p.add_argument("--no-gate", action="store_true", help="disable the hit-rate quality gate")
     p.add_argument("--gate-window", type=int, default=120)
     p.add_argument("--cost-bps", type=float, default=5.0)
@@ -247,6 +250,7 @@ def _config(args) -> PipelineConfig:
         strategy=StrategyConfig(
             entry_band=args.entry_band, full_edge=args.full_edge, long_only=args.long_only, target_vol=args.target_vol,
             max_leverage=args.max_leverage, smoothing=args.smoothing,
+            rebalance_band=args.band,
             quality_gate=not args.no_gate, gate_window=args.gate_window,
             periods_per_year=ppy,
         ),

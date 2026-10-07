@@ -115,3 +115,9 @@ def test_cli_roundtrip(tmp_path, df, capsys):
     assert out.exists()
     assert main(["signal", *args]) == 0
     assert "target_position" in capsys.readouterr().out
+
+
+def test_rebalance_band_skips_small_changes_but_always_exits():
+    from trade_ai.strategy import apply_rebalance_band
+    t = pd.Series([0.5, 0.53, 0.58, 0.4, 0.0, 0.02])
+    assert list(apply_rebalance_band(t, 0.05)) == [0.5, 0.5, 0.58, 0.4, 0.0, 0.0]

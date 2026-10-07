@@ -72,6 +72,7 @@ python -m trade_ai signal --ticker SPY
 | `--long-only` | off | 売りポジションを取らない |
 | `--no-gate` / `--gate-window` | on / 120 | 品質ゲートの無効化 / 的中率の計算期間 |
 | `--cost-bps` / `--slippage-bps` | 5 / 2 | 片道コスト (bps) |
+| `--band` | 0 | 目標ポジションの変化がこれ未満なら売買しない（実運用の `--rebalance-band` と同じ動作をバックテストで再現） |
 | `--periods-per-year` | 252（`--binance` は自動） | 日足以外（例: 時間足）の年率換算に使用 |
 
 ## 暗号資産パーペチュアル / Variational での自動売買
