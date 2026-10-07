@@ -152,6 +152,9 @@ def test_binance_funding_parses():
         return [{"fundingTime": 1_767_225_600_000, "fundingRate": "0.0001"}]
     s = load_binance_funding("BTCUSDT", http_get=fake_get)
     assert s.iloc[0] == 0.0001 and s.index[0] == pd.Timestamp("2026-01-01")
+    empty = load_binance_funding("NEWUSDT", http_get=lambda url, params: [])
+    idx = pd.date_range("2026-01-01", periods=3, freq="h")
+    assert (funding_per_bar(empty, idx, pd.Timedelta(hours=1)) == 0).all()
 
 
 def test_variational_client_and_broker():

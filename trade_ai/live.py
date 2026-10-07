@@ -49,6 +49,7 @@ class TraderConfig:
     risk: RiskLimits = field(default_factory=RiskLimits)
     dry_run: bool = True
     state_dir: str = "trade_state"
+    top_n: int = 1                     # equity slices when trading a universe
 
 
 def _now() -> pd.Timestamp:
@@ -88,7 +89,8 @@ class Trader:
     def _daily_loss_halt(self, equity: float) -> bool:
         day = str(self.now().date())
         if self.risk_state.get("day") != day:
-            self.risk_state = {"day": day, "start_equity": equity, "halted": False}
+            self.risk_state = {**self.risk_state, "day": day, "start_equity": equity,
+                               "halted": False}
         start = self.risk_state["start_equity"]
         if not self.risk_state["halted"] and start > 0 and \
                 equity < start * (1 - self.cfg.risk.max_daily_loss):
@@ -96,23 +98,31 @@ class Trader:
         self._save_risk()
         return self.risk_state["halted"]
 
-    def step(self, df: pd.DataFrame) -> dict:
+    def step(self, df: pd.DataFrame, symbol: str | None = None, weight: float = 1.0) -> dict:
+        """Move ``symbol`` (default: the configured venue symbol) to its target.
+
+        ``weight`` is the slice of equity this symbol may use (1 / number of symbols
+        when trading a universe).
+        """
         cfg, risk = self.cfg, self.cfg.risk
+        sym = symbol or cfg.venue_symbol
         bar = interval_to_timedelta(cfg.interval)
         last_close_time = df.index[-1] + bar
         age = self.now() - last_close_time
         if age > bar:
-            return self._record({"action": "skip", "reason": f"stale data: last bar closed {age} ago"})
+            return self._record({"symbol": sym, "action": "skip",
+                                 "reason": f"stale data: last bar closed {age} ago"})
 
         sig = latest_target(df, cfg.strategy, cfg.pipeline, cfg.rules)
         target_frac = max(-risk.max_abs_position, min(risk.max_abs_position, sig["target_position"]))
+        target_frac *= weight
 
-        sym = cfg.venue_symbol
         price = self.broker.price(sym)
         equity = self.broker.equity()
         current = self.broker.position(sym)
-        base = {"strategy": cfg.strategy, "bar": str(df.index[-1]), "signal": sig,
-                "price": price, "equity": equity, "position": current}
+        base = {"symbol": sym, "strategy": cfg.strategy, "weight": weight,
+                "bar": str(df.index[-1]), "signal": sig, "price": price, "equity": equity,
+                "position": current}
 
         if self._daily_loss_halt(equity):
             target_frac, base["halted"] = 0.0, True
@@ -126,23 +136,58 @@ class Trader:
 
         notional = abs(delta) * price
         flattening = target_qty == 0 and current != 0
+        return self._execute(sym, delta, notional, equity, flattening, base)
+
+    def _execute(self, sym: str, delta: float, notional: float, equity: float,
+                 flattening: bool, base: dict) -> dict:
+        risk = self.cfg.risk
         if notional < risk.min_trade_notional or \
                 (not flattening and equity > 0 and notional / equity < risk.rebalance_band):
             return self._record({**base, "action": "hold", "reason": "change below threshold"})
-        if cfg.dry_run:
+        if self.cfg.dry_run:
             return self._record({**base, "action": "dry_run"})
         fill = self.broker.market_order(sym, delta)
         return self._record({**base, "action": "order", "fill": asdict(fill)})
 
+    def step_universe(self, frames: dict[str, pd.DataFrame]) -> list[dict]:
+        """Trade every symbol in ``frames`` (venue symbol -> candles) with an equal slice
+        of equity, and close positions in symbols that dropped out of the universe."""
+        decisions = []
+        previous = self.risk_state.get("universe", [])
+        for sym in previous:
+            if sym in frames:
+                continue
+            qty = self.broker.position(sym)
+            if qty:
+                price = self.broker.price(sym)
+                base = {"symbol": sym, "reason": "left universe", "position": qty,
+                        "target_qty": 0.0, "order_qty": -qty, "price": price}
+                decisions.append(self._execute(sym, -qty, abs(qty) * price,
+                                               self.broker.equity(), True, base))
+        weight = 1.0 / max(self.cfg.top_n, len(frames), 1)
+        for sym, df in frames.items():
+            decisions.append(self.step(df, sym, weight))
+        self.risk_state["universe"] = list(frames)
+        self._save_risk()
+        return decisions
 
-def run_loop(trader: Trader, load: Callable[[], pd.DataFrame], once: bool = False,
-             delay_s: float = 5.0, max_errors: int = 5) -> None:
-    """Run ``trader.step`` right after every candle close, forever (or once)."""
+
+def run_loop(trader: Trader, load: Callable[[], pd.DataFrame | dict[str, pd.DataFrame]],
+             once: bool = False, delay_s: float = 5.0, max_errors: int = 5) -> None:
+    """Run the trader right after every candle close, forever (or once).
+
+    ``load`` returns one DataFrame (single symbol) or a dict of venue symbol ->
+    DataFrame (volume-selected universe).
+    """
     bar = interval_to_timedelta(trader.cfg.interval)
     errors = 0
     while True:
         try:
-            trader.step(load())
+            data = load()
+            if isinstance(data, dict):
+                trader.step_universe(data)
+            else:
+                trader.step(data)
             errors = 0
         except NotImplementedError:
             raise

@@ -124,6 +124,39 @@ python -m trade_ai signal   --binance BTCUSDT --interval 1h --strategy ma_cross 
 
 Variational は取引手数料ゼロですが RFQ のスプレッドがかかるため、`--cost-bps 0 --slippage-bps 3` のようにスリッページ側で見積もってください。
 
+### 出来高で取引銘柄を選ぶ（ユニバース選定）
+
+流動性の高い（よく取引されている）銘柄ほどスプレッド・スリッページが小さく、シグナルもノイズが少なくなります。
+`--universe` を付けると、Binance 無期限先物を**売買代金（価格×出来高）**で順位付けし、上位 `--top-n` 銘柄だけを取引します。
+
+| オプション | 既定値 | 内容 |
+|---|---|---|
+| `--rank-by` | quote_volume | `quote_volume`＝直近 `--volume-window` 本の売買代金が多い順 / `surge`＝直近 `--surge-window` 本の売買代金が平常時の何倍か（**出来高急増**銘柄） |
+| `--top-n` | 5 | 同時に取引する銘柄数（資金を均等に 1/N ずつ割り当て、空き枠は現金） |
+| `--candidates` / `--symbols` | 30 / なし | 候補：現在の24h売買代金上位 N 銘柄、または明示リスト |
+| `--volume-window` / `--surge-window` | 168 / 24 | 順位付けに使う本数（1時間足なら7日 / 1日） |
+| `--rebalance-every` | 24 | 何本ごとに順位を付け直すか（頻繁な入れ替えを防ぐ） |
+| `--min-quote-volume` | 2000万 USDT | 24h 売買代金の下限（急増ランキングでも薄い銘柄は除外） |
+| `--variational-only` | off | Variational Omni に上場している銘柄だけを対象 |
+
+ステーブルコイン（USDC 等）は自動で除外。順位から外れた銘柄のポジションは決済されます。
+
+```bash
+# 今の出来高ランキングと選ばれる銘柄を表示
+python -m trade_ai screen --top-n 5 --variational-only
+python -m trade_ai screen --top-n 5 --rank-by surge
+
+# 出来高上位5銘柄をブレイクアウト戦略で運用した場合のバックテスト
+python -m trade_ai backtest --universe --candidates 30 --top-n 5 --start 2025-01-01 --strategy breakout
+
+# ペーパー取引で運用
+python -m trade_ai trade --universe --top-n 5 --strategy vwap_obv --execute --paper-prices variational
+```
+
+バックテストでは各時点で**その時点までの出来高だけ**で銘柄を選び直します（将来の出来高を使わない）。
+ただし候補リスト自体は「現在」上場している銘柄から作るため、上場廃止銘柄が含まれない**生存者バイアス**が残ります。
+結果は「選ばれていた期間の割合と銘柄別の損益寄与」も表示するので、特定銘柄だけで勝っていないか確認してください。
+
 ### ペーパー取引 / 実運用ループ
 
 ```bash
@@ -178,7 +211,9 @@ trade_ai/
   crypto_data.py Binance 先物のローソク足・ファンディング取得
   brokers.py    取引所インターフェースとペーパー取引
   variational.py Variational Omni アダプタ（公開データ／トレードAPI待ち）
-  live.py       リスク管理付きの売買ループ
+  universe.py   出来高による銘柄選定（売買代金 / 出来高急増）
+  portfolio.py  複数銘柄バックテスト
+  live.py       リスク管理付きの売買ループ（単一銘柄 / 複数銘柄）
   cli.py        コマンドライン
 tests/          リーク検出を含むテスト
 ```

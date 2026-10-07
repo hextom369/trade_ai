@@ -9,6 +9,11 @@ Examples:
 Crypto perps (Binance futures candles + funding, Variational-ready):
     python -m trade_ai backtest --binance BTCUSDT --interval 1h --start 2024-01-01 --strategy breakout
     python -m trade_ai trade --binance BTCUSDT --venue-symbol BTC --strategy ma_cross --once
+
+Volume-selected universe (trade the most traded markets):
+    python -m trade_ai screen --top-n 5 --variational-only
+    python -m trade_ai backtest --universe --candidates 30 --top-n 5 --start 2025-01-01 --strategy breakout
+    python -m trade_ai trade --universe --top-n 5 --strategy vwap_obv --once
 """
 
 from __future__ import annotations
@@ -18,6 +23,8 @@ import json
 import logging
 import os
 
+import pandas as pd
+
 from .brokers import PaperBroker
 from .crypto_data import (funding_per_bar, interval_to_timedelta, load_binance_funding,
                           load_binance_klines, periods_per_year)
@@ -26,8 +33,11 @@ from .live import RiskLimits, Trader, TraderConfig, run_loop
 from .metrics import format_summary
 from .model import WalkForwardConfig
 from .pipeline import PipelineConfig, latest_target, run_pipeline, run_rule_pipeline
+from .portfolio import run_portfolio_backtest
 from .rules import RULES, RuleConfig
 from .strategy import StrategyConfig
+from .universe import (RANK_BY, binance_24h_quote_volume, point_in_time_universe, prefilter,
+                       rank_universe, venue_ticker, volume_scores)
 from .variational import VariationalBroker, VariationalPublicClient
 
 
@@ -38,6 +48,9 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     src.add_argument("--synthetic", action="store_true", help="use generated demo data")
     src.add_argument("--binance", metavar="SYMBOL",
                      help="Binance USDT-M perpetual candles, e.g. BTCUSDT")
+    src.add_argument("--universe", action="store_true",
+                     help="trade the top --top-n Binance perps ranked by volume")
+    _add_universe(p)
     p.add_argument("--interval", default="1h", help="candle interval for --binance (1m..1w)")
     p.add_argument("--no-funding", action="store_true",
                    help="ignore perp funding in the backtest (--binance only)")
@@ -81,6 +94,112 @@ def _add_common(p: argparse.ArgumentParser) -> None:
                    help="default: 252, or 24/7 bars per year for --binance")
 
 
+def _add_universe(p: argparse.ArgumentParser) -> None:
+    g = p.add_argument_group("volume-based symbol selection (--universe / screen)")
+    g.add_argument("--symbols", help="comma-separated candidate symbols (default: current "
+                   "top --candidates by 24h traded value)")
+    g.add_argument("--candidates", type=int, default=30)
+    g.add_argument("--top-n", type=int, default=5, help="symbols traded at once")
+    g.add_argument("--rank-by", choices=RANK_BY, default="quote_volume",
+                   help="quote_volume = most traded value; surge = sudden volume increase")
+    g.add_argument("--volume-window", type=int, default=168,
+                   help="bars of traded value used for ranking (168 = 7 days of 1h)")
+    g.add_argument("--surge-window", type=int, default=24,
+                   help="recent bars compared to the --volume-window average for surge")
+    g.add_argument("--rebalance-every", type=int, default=24, help="re-rank every N bars")
+    g.add_argument("--min-quote-volume", type=float, default=20e6,
+                   help="minimum 24h traded value in USDT (liquidity floor)")
+    g.add_argument("--variational-only", action="store_true",
+                   help="only symbols listed on Variational Omni")
+
+
+def _candidates(args) -> list[str]:
+    if args.symbols:
+        return [x.strip().upper() for x in args.symbols.split(",") if x.strip()]
+    allowed = None
+    if args.variational_only:
+        allowed = {str(x.get("ticker", "")).upper()
+                   for x in VariationalPublicClient().listings()}
+    return prefilter(binance_24h_quote_volume(), args.candidates, args.min_quote_volume, allowed)
+
+
+def _window_floor(args) -> float:
+    """--min-quote-volume (per 24h) expressed over --volume-window bars."""
+    days = args.volume_window * interval_to_timedelta(args.interval) / pd.Timedelta(days=1)
+    return args.min_quote_volume * days
+
+
+def _load_frames(args, symbols, limit=None) -> dict:
+    frames = {}
+    for sym in symbols:
+        try:
+            if limit:
+                frames[sym] = load_binance_klines(sym, args.interval, limit=limit)
+            else:
+                frames[sym] = load_binance_klines(sym, args.interval, args.start, args.end)
+        except ValueError as exc:  # e.g. delisted / no candles in range
+            logging.warning("skipping %s: %s", sym, exc)
+    return frames
+
+
+def _select_now(args, frames: dict) -> tuple[list[str], pd.DataFrame]:
+    """Rank on the latest bar exactly as the backtest does at each rebalance."""
+    liquidity, surge = volume_scores(frames, args.volume_window, args.surge_window)
+    # No forward-fill: a symbol without a candle on the latest bar is not tradable.
+    last_liq, last_surge = liquidity.iloc[-1], surge.iloc[-1]
+    chosen = rank_universe(last_liq, last_surge, args.top_n, args.rank_by, _window_floor(args))
+    table = pd.DataFrame({"venue": [venue_ticker(s) for s in last_liq.index],
+                          "window_value_usd": last_liq, "surge": last_surge})
+    table["selected"] = table.index.isin(chosen)
+    key = "window_value_usd" if args.rank_by == "quote_volume" else "surge"
+    return chosen, table.sort_values(key, ascending=False)
+
+
+def _universe_backtest(args, cfg: PipelineConfig) -> int:
+    frames = _load_frames(args, _candidates(args))
+    if not frames:
+        raise SystemExit("no candle data for any candidate symbol")
+    bar = interval_to_timedelta(args.interval)
+    funding = None
+    if not args.no_funding:
+        funding = {}
+        for sym, df in frames.items():
+            events = load_binance_funding(sym, start=df.index[0], end=df.index[-1] + bar)
+            funding[sym] = funding_per_bar(events, df.index, bar)
+    members = point_in_time_universe(frames, args.top_n, args.volume_window, args.surge_window,
+                                     args.rebalance_every, args.rank_by, _window_floor(args))
+    res = run_portfolio_backtest(frames, members, args.top_n, args.strategy, cfg, _rules(args),
+                                 funding)
+    b = res.backtest
+    print(f"Universe: top {args.top_n} of {len(frames)} by {args.rank_by}, "
+          f"re-ranked every {args.rebalance_every} bars")
+    print(f"Period: {b.returns.index[0]} -> {b.returns.index[-1]}")
+    print("\nStrategy")
+    print(format_summary(b.stats))
+    print("\nEqual-weight buy & hold of the selected symbols")
+    print(format_summary(b.benchmark_stats))
+    share = res.membership.loc[b.returns.index].mean().sort_values(ascending=False)
+    contrib = res.contributions.sum().reindex(share.index)
+    print("\nTime selected / summed return contribution")
+    for sym in share.index[share > 0]:
+        print(f"  {sym:<16}{share[sym]:>8.1%}{contrib[sym]:>10.2%}")
+    if args.output:
+        b.returns.to_frame().join([b.positions, b.equity, b.benchmark]).join(
+            res.membership.loc[b.returns.index].add_prefix("in_")).to_csv(args.output)
+        print(f"\nwrote {args.output}")
+    return 0
+
+
+def _screen(args) -> int:
+    limit = args.volume_window + args.surge_window + 2
+    frames = _load_frames(args, _candidates(args), limit=limit)
+    chosen, table = _select_now(args, frames)
+    with pd.option_context("display.float_format", "{:,.2f}".format, "display.width", 120):
+        print(table.to_string())
+    print("\nselected:", ", ".join(chosen) or "(none)")
+    return 0
+
+
 def _load(args):
     if args.binance:
         df = load_binance_klines(args.binance, args.interval, args.start, args.end)
@@ -117,7 +236,7 @@ def _rules(args) -> RuleConfig:
 def _config(args) -> PipelineConfig:
     ppy = args.periods_per_year
     if ppy is None:
-        ppy = periods_per_year(args.interval) if args.binance else 252
+        ppy = periods_per_year(args.interval) if (args.binance or args.universe) else 252
     return PipelineConfig(
         label_threshold=args.label_threshold,
         volume_features=not args.no_volume_features,
@@ -160,11 +279,27 @@ def main(argv: list[str] | None = None) -> int:
     tr.add_argument("--min-trade-notional", type=float, default=10.0)
     tr.add_argument("--rebalance-band", type=float, default=0.05)
     tr.add_argument("--max-daily-loss", type=float, default=0.05)
+    sc = sub.add_parser("screen", help="rank Binance perps by volume and show the selection")
+    sc.add_argument("--interval", default="1h")
+    _add_universe(sc)
     args = parser.parse_args(argv)
 
+    if args.command == "screen":
+        return _screen(args)
     cfg = _config(args)
     if args.command == "trade":
         return _trade(args, cfg)
+    if args.universe:
+        if args.command == "backtest":
+            return _universe_backtest(args, cfg)
+        frames = _load_frames(args, _candidates(args), limit=max(args.volume_window + 2, 1500))
+        chosen, _ = _select_now(args, frames)
+        out = [latest_target(frames[s], args.strategy, cfg, _rules(args)) | {"symbol": s}
+               for s in chosen]
+        for o in out:
+            o["target_position"] /= max(args.top_n, 1)  # equal slice of equity
+        print(json.dumps(out, indent=2))
+        return 0
     df = _load(args)
     if args.command == "backtest":
         funding = _funding(args, df)
@@ -189,34 +324,67 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _trade(args, cfg: PipelineConfig) -> int:
-    if not args.binance:
-        raise SystemExit("trade needs --binance SYMBOL as its candle source")
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-    venue = args.venue_symbol or args.binance.upper().removesuffix("USDT")
-    latest: dict = {}
+def _universe_loader(args, latest: dict):
+    """Loader for run_loop: re-rank every --rebalance-every bars, else reuse the selection."""
+    bar = interval_to_timedelta(args.interval)
+    path = os.path.join(args.state_dir, "universe_selection.json")
+    limit = max(args.lookback, args.volume_window + args.surge_window + 2)
 
     def load():
-        df = load_binance_klines(args.binance, args.interval, limit=args.lookback)
-        latest["close"] = float(df["close"].iloc[-1])
-        return df
+        period = int(pd.Timestamp.now(tz="UTC").value // (bar * args.rebalance_every).value)
+        saved = {}
+        if os.path.exists(path):
+            with open(path) as f:
+                saved = json.load(f)
+        if saved.get("period") == period and saved.get("symbols"):
+            frames = _load_frames(args, saved["symbols"], limit=limit)
+        else:
+            frames = _load_frames(args, _candidates(args), limit=limit)
+            chosen, table = _select_now(args, frames)
+            logging.info("universe re-ranked by %s:\n%s", args.rank_by, table.head(15))
+            frames = {s: frames[s] for s in chosen}
+            with open(path, "w") as f:
+                json.dump({"period": period, "symbols": chosen}, f)
+        out = {}
+        for sym, df in frames.items():
+            latest[venue_ticker(sym)] = float(df["close"].iloc[-1])
+            out[venue_ticker(sym)] = df
+        return out
+    return load
+
+
+def _trade(args, cfg: PipelineConfig) -> int:
+    if not (args.binance or args.universe):
+        raise SystemExit("trade needs --binance SYMBOL or --universe as its candle source")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    os.makedirs(args.state_dir, exist_ok=True)
+    latest: dict = {}
+    if args.universe:
+        venue, top_n = "", args.top_n
+        load = _universe_loader(args, latest)
+    else:
+        venue, top_n = args.venue_symbol or venue_ticker(args.binance), 1
+
+        def load():
+            df = load_binance_klines(args.binance, args.interval, limit=args.lookback)
+            latest[venue] = float(df["close"].iloc[-1])
+            return df
 
     if args.broker == "variational":
         broker = VariationalBroker()
     else:
         source = (VariationalPublicClient().mark_price if args.paper_prices == "variational"
-                  else lambda _sym: latest["close"])
-        os.makedirs(args.state_dir, exist_ok=True)
+                  else latest.__getitem__)
         broker = PaperBroker(initial_equity=args.paper_equity, slippage_bps=args.slippage_bps,
                              fee_bps=args.cost_bps, price_source=source,
                              state_path=os.path.join(args.state_dir, "paper_account.json"))
     trader = Trader(broker, TraderConfig(
-        data_symbol=args.binance, venue_symbol=venue, interval=args.interval,
+        data_symbol=args.binance or "", venue_symbol=venue, interval=args.interval,
         strategy=args.strategy, pipeline=cfg, rules=_rules(args),
         risk=RiskLimits(max_abs_position=args.max_position, max_notional=args.max_notional,
                         min_trade_notional=args.min_trade_notional,
                         rebalance_band=args.rebalance_band, max_daily_loss=args.max_daily_loss),
-        dry_run=not args.execute, state_dir=args.state_dir))
+        dry_run=not args.execute, state_dir=args.state_dir, top_n=top_n))
     try:
         run_loop(trader, load, once=args.once)
     except NotImplementedError as exc:

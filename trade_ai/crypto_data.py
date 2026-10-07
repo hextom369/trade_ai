@@ -119,7 +119,7 @@ def load_binance_funding(symbol: str, start=None, end=None, limit: int = 1000,
             break
         cursor = int(batch[-1]["fundingTime"]) + 1
     if not rows:
-        return pd.Series(dtype=float, name="funding")
+        return pd.Series(dtype=float, name="funding", index=pd.DatetimeIndex([]))
     s = pd.Series([float(r["fundingRate"]) for r in rows],
                   index=pd.to_datetime([int(r["fundingTime"]) for r in rows], unit="ms"),
                   name="funding")
@@ -134,10 +134,10 @@ def funding_per_bar(events: pd.Series, bar_index: pd.DatetimeIndex,
     an event at time T inside [open_t, open_{t+1}) is charged to bar t's position.
     """
     out = pd.Series(0.0, index=bar_index, name="funding")
-    if bar_length is not None and len(bar_index):
-        events = events[events.index < bar_index[-1] + bar_length]
     if events.empty or len(bar_index) == 0:
         return out
+    if bar_length is not None:
+        events = events[events.index < bar_index[-1] + bar_length]
     pos = np.searchsorted(bar_index.values, events.index.values, side="right") - 1
     ok = pos >= 0
     sums = pd.Series(events.to_numpy()[ok]).groupby(pos[ok]).sum()
