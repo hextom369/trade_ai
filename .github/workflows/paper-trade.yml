@@ -1,0 +1,75 @@
+name: Paper trading
+
+# Runs one paper-trading cycle shortly after every 4h candle closes
+# (00/04/08/12/16/20 UTC). The paper account and decision log live on the
+# `paper-state` branch, so main's history stays clean.
+on:
+  schedule:
+    - cron: "7 0,4,8,12,16,20 * * *"
+  workflow_dispatch:
+  push:
+    branches: [ccr-50fa23a7-rlb0yo]
+    paths: [.github/workflows/paper-trade.yml]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: paper-trading
+  cancel-in-progress: false
+
+env:
+  STATE_BRANCH: paper-state
+
+jobs:
+  cycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -e .
+
+      - name: Load paper account
+        run: |
+          if git fetch --depth=1 origin "$STATE_BRANCH"; then
+            git worktree add --detach state FETCH_HEAD
+            git -C state checkout -q -B "$STATE_BRANCH"
+          else
+            git worktree add --detach state
+            git -C state checkout -q --orphan "$STATE_BRANCH"
+            git -C state rm -rfq .
+          fi
+
+      # 4h Donchian breakout on BTC, sized like the backtest (40% target vol,
+      # max 1x, 10% rebalance band, no fees, 3 bps slippage). Spot candles come
+      # from Binance's public data host because fapi.binance.com rejects US runners.
+      - name: Trade one cycle
+        run: >
+          python -m trade_ai trade
+          --binance BTCUSDT --market spot --interval 4h --lookback 500
+          --strategy breakout --band 0.1 --target-vol 0.4
+          --cost-bps 0 --slippage-bps 3
+          --paper-equity 10000 --max-daily-loss 0.10
+          --execute --once --state-dir state/trade_state
+
+      - name: Report
+        if: always()
+        run: |
+          python -m trade_ai report --state-dir state/trade_state --paper-equity 10000 \
+            | tee state/README.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save paper account
+        if: always()
+        working-directory: state
+        run: |
+          git add -A
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "Paper trading cycle $(date -u +%Y-%m-%dT%H:%MZ)" || exit 0
+          git push origin "HEAD:$STATE_BRANCH"

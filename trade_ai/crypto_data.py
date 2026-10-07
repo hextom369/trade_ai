@@ -22,6 +22,14 @@ import pandas as pd
 from .data import _normalize
 
 BINANCE_FUTURES = "https://fapi.binance.com"
+# Binance's public market-data host. Unlike fapi.binance.com it also answers from
+# regions where Binance trading is restricted (e.g. US-hosted CI runners).
+BINANCE_SPOT_DATA = "https://data-api.binance.vision"
+# market -> (base url, klines path, max candles per request)
+KLINE_ENDPOINTS = {
+    "futures": (BINANCE_FUTURES, "/fapi/v1/klines", 1500),
+    "spot": (BINANCE_SPOT_DATA, "/api/v3/klines", 1000),
+}
 HttpGet = Callable[[str, dict], Any]
 
 _UNIT = {"m": "min", "h": "h", "d": "D", "w": "W"}
@@ -60,13 +68,17 @@ def _ms(ts) -> int:
 def load_binance_klines(symbol: str, interval: str = "1h", start: str | None = None,
                         end: str | None = None, limit: int = 1500,
                         http_get: HttpGet | None = None, now_ms: int | None = None,
-                        base_url: str = BINANCE_FUTURES) -> pd.DataFrame:
-    """Download closed perpetual-futures candles, paginating forward from ``start``.
+                        market: str = "futures") -> pd.DataFrame:
+    """Download closed candles, paginating forward from ``start``.
 
-    Without ``start`` the most recent ``limit`` candles are returned. The index is
-    each bar's open time (UTC, tz-naive); the close of bar t is known at open of t+1.
+    ``market`` is "futures" (USDT-M perpetuals) or "spot" (served from Binance's
+    public data host). Without ``start`` the most recent ``limit`` candles are
+    returned. The index is each bar's open time (UTC, tz-naive); the close of bar t
+    is known at open of t+1.
     """
     http_get = http_get or http_get_json
+    base_url, path, max_limit = KLINE_ENDPOINTS[market]
+    limit = min(limit, max_limit)
     now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
     params: dict = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
     end_ms = _ms(end) if end else None
@@ -74,11 +86,11 @@ def load_binance_klines(symbol: str, interval: str = "1h", start: str | None = N
         params["endTime"] = end_ms
     rows: list = []
     if start is None:
-        rows = list(http_get(f"{base_url}/fapi/v1/klines", params))
+        rows = list(http_get(f"{base_url}{path}", params))
     else:
         cursor = _ms(start)
         while True:
-            batch = http_get(f"{base_url}/fapi/v1/klines", {**params, "startTime": cursor})
+            batch = http_get(f"{base_url}{path}", {**params, "startTime": cursor})
             if not batch:
                 break
             rows.extend(batch)

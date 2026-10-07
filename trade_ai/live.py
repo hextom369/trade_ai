@@ -195,7 +195,7 @@ def run_loop(trader: Trader, load: Callable[[], pd.DataFrame | dict[str, pd.Data
             errors += 1
             log.exception("cycle failed (%d/%d)", errors, max_errors)
             trader._record({"action": "error", "error": repr(exc)})
-            if errors >= max_errors:
+            if once or errors >= max_errors:
                 raise
         if once:
             return

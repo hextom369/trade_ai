@@ -244,3 +244,50 @@ def test_cli_trade_once_paper(tmp_path, monkeypatch, capsys):
     rec = json.loads((state / "decisions.jsonl").read_text().splitlines()[-1])
     assert rec["action"] in ("order", "hold") and rec["strategy"] == "breakout"
     assert (state / "paper_account.json").exists() or rec["action"] == "hold"
+
+
+def test_spot_market_uses_public_data_host_and_caps_limit():
+    calls = []
+
+    def fake_get(url, params):
+        calls.append((url, params))
+        return [_kline(1_767_225_600_000)]
+    load_binance_klines("BTCUSDT", "4h", limit=1500, http_get=fake_get,
+                        now_ms=1_767_225_600_000 + 2 * HOUR_MS, market="spot")
+    url, params = calls[0]
+    assert url == "https://data-api.binance.vision/api/v3/klines"
+    assert params["limit"] == 1000
+
+
+def test_paper_report_after_cli_trade(tmp_path, monkeypatch, capsys):
+    df = hourly()
+    df.index = pd.date_range(end=pd.Timestamp.now("UTC").tz_localize(None).floor("h")
+                             - pd.Timedelta(hours=1), periods=len(df), freq="h", name="date")
+    seen = {}
+
+    def fake_klines(*a, **k):
+        seen.update(k)
+        return df
+    monkeypatch.setattr(cli, "load_binance_klines", fake_klines)
+    state = str(tmp_path / "state")
+    args = ["--binance", "BTCUSDT", "--market", "spot", "--strategy", "breakout",
+            "--state-dir", state]
+    assert cli.main(["trade", *args, "--once", "--execute", "--rebalance-band", "0",
+                     "--min-trade-notional", "0"]) == 0
+    assert seen["market"] == "spot"
+    capsys.readouterr()
+    assert cli.main(["report", "--state-dir", state]) == 0
+    out = capsys.readouterr().out
+    assert "## Paper trading" in out and "Equity:" in out and "| BTC |" in out
+
+
+def test_run_once_raises_after_logging_error(tmp_path):
+    from trade_ai.live import run_loop
+    t = _trader(tmp_path, PaperBroker(10_000), hourly())
+
+    def broken():
+        raise ConnectionError("exchange unreachable")
+    with pytest.raises(ConnectionError):
+        run_loop(t, broken, once=True)
+    last = json.loads((tmp_path / "decisions.jsonl").read_text().splitlines()[-1])
+    assert last["action"] == "error"

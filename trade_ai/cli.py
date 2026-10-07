@@ -34,6 +34,7 @@ from .metrics import format_summary
 from .model import WalkForwardConfig
 from .pipeline import PipelineConfig, latest_target, run_pipeline, run_rule_pipeline
 from .portfolio import run_portfolio_backtest
+from .report import paper_report
 from .rules import RULES, RuleConfig
 from .strategy import StrategyConfig
 from .universe import (RANK_BY, binance_24h_quote_volume, point_in_time_universe, prefilter,
@@ -52,6 +53,9 @@ def _add_common(p: argparse.ArgumentParser) -> None:
                      help="trade the top --top-n Binance perps ranked by volume")
     _add_universe(p)
     p.add_argument("--interval", default="1h", help="candle interval for --binance (1m..1w)")
+    p.add_argument("--market", choices=["futures", "spot"], default="futures",
+                   help="Binance candles: USDT-M perps, or spot from the public data host "
+                        "(reachable from US-hosted CI; no funding)")
     p.add_argument("--no-funding", action="store_true",
                    help="ignore perp funding in the backtest (--binance only)")
     p.add_argument("--start")
@@ -116,6 +120,10 @@ def _add_universe(p: argparse.ArgumentParser) -> None:
                    help="only symbols listed on Variational Omni")
 
 
+def _market(args) -> str:
+    return getattr(args, "market", "futures")
+
+
 def _candidates(args) -> list[str]:
     if args.symbols:
         return [x.strip().upper() for x in args.symbols.split(",") if x.strip()]
@@ -137,9 +145,11 @@ def _load_frames(args, symbols, limit=None) -> dict:
     for sym in symbols:
         try:
             if limit:
-                frames[sym] = load_binance_klines(sym, args.interval, limit=limit)
+                frames[sym] = load_binance_klines(sym, args.interval, limit=limit,
+                                                  market=_market(args))
             else:
-                frames[sym] = load_binance_klines(sym, args.interval, args.start, args.end)
+                frames[sym] = load_binance_klines(sym, args.interval, args.start, args.end,
+                                                  market=_market(args))
         except ValueError as exc:  # e.g. delisted / no candles in range
             logging.warning("skipping %s: %s", sym, exc)
     return frames
@@ -164,7 +174,7 @@ def _universe_backtest(args, cfg: PipelineConfig) -> int:
         raise SystemExit("no candle data for any candidate symbol")
     bar = interval_to_timedelta(args.interval)
     funding = None
-    if not args.no_funding:
+    if not args.no_funding and _market(args) == "futures":
         funding = {}
         for sym, df in frames.items():
             events = load_binance_funding(sym, start=df.index[0], end=df.index[-1] + bar)
@@ -205,7 +215,8 @@ def _screen(args) -> int:
 
 def _load(args):
     if args.binance:
-        df = load_binance_klines(args.binance, args.interval, args.start, args.end)
+        df = load_binance_klines(args.binance, args.interval, args.start, args.end,
+                                 market=_market(args))
     elif args.csv:
         df = load_csv(args.csv)
     elif args.ticker:
@@ -220,7 +231,7 @@ def _load(args):
 
 
 def _funding(args, df):
-    if not args.binance or args.no_funding:
+    if not args.binance or args.no_funding or _market(args) != "futures":
         return None
     events = load_binance_funding(args.binance, start=df.index[0],
                                   end=df.index[-1] + interval_to_timedelta(args.interval))
@@ -283,6 +294,9 @@ def main(argv: list[str] | None = None) -> int:
     tr.add_argument("--min-trade-notional", type=float, default=10.0)
     tr.add_argument("--rebalance-band", type=float, default=0.05)
     tr.add_argument("--max-daily-loss", type=float, default=0.05)
+    rp = sub.add_parser("report", help="summarize a paper/live trading state directory")
+    rp.add_argument("--state-dir", default="trade_state")
+    rp.add_argument("--paper-equity", type=float, default=10_000.0)
     sc = sub.add_parser("screen", help="rank Binance perps by volume and show the selection")
     sc.add_argument("--interval", default="1h")
     _add_universe(sc)
@@ -290,6 +304,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "screen":
         return _screen(args)
+    if args.command == "report":
+        print(paper_report(args.state_dir, args.paper_equity), end="")
+        return 0
     cfg = _config(args)
     if args.command == "trade":
         return _trade(args, cfg)
@@ -370,7 +387,8 @@ def _trade(args, cfg: PipelineConfig) -> int:
         venue, top_n = args.venue_symbol or venue_ticker(args.binance), 1
 
         def load():
-            df = load_binance_klines(args.binance, args.interval, limit=args.lookback)
+            df = load_binance_klines(args.binance, args.interval, limit=args.lookback,
+                                     market=_market(args))
             latest[venue] = float(df["close"].iloc[-1])
             return df
 

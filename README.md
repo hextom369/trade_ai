@@ -185,6 +185,18 @@ python -m trade_ai trade --binance BTCUSDT --venue-symbol BTC --strategy breakou
 Python からは `trade_ai.live.Trader` に任意の `Broker`（`trade_ai.brokers.Broker` を継承）を渡せます。
 Variational 以外の API がある DEX/CEX も同じ形でアダプタを追加すれば動きます。
 
+### GitHub Actions でペーパートレード（PC 不要）
+
+`.github/workflows/paper-trade.yml` が 4 時間足の確定直後（UTC 0/4/8/12/16/20 時の 7 分）に 1 サイクルずつ実行します。
+
+- 戦略：BTC 4 時間足ブレイクアウト（`--band 0.1`、目標ボラ 40%、最大 1 倍、手数料 0・スリッページ 3bps、初期資金 10,000）
+- データ：Binance の公開データホスト（`--market spot`）。GitHub の実行環境は米国にあり、先物 API（fapi.binance.com）は米国から使えないため
+- 口座・判断ログは **`paper-state` ブランチ**に保存（`README.md` に最新の成績、`trade_state/decisions.jsonl` に全判断）
+- 各実行の Summary ページにも成績表を表示。Actions タブの「Run workflow」で手動実行も可能
+- 手元で同じ集計を見るには：`python -m trade_ai report --state-dir trade_state`
+
+> 定期実行（schedule）は**デフォルトブランチ（main）にあるワークフローだけ**が動きます。また GitHub はリポジトリに 60 日間動きがないと定期実行を自動停止します。
+
 ## Python から使う
 
 ```python
@@ -215,6 +227,7 @@ trade_ai/
   universe.py   出来高による銘柄選定（売買代金 / 出来高急増）
   portfolio.py  複数銘柄バックテスト
   live.py       リスク管理付きの売買ループ（単一銘柄 / 複数銘柄）
+  report.py     ペーパー口座の成績レポート
   cli.py        コマンドライン
 tests/          リーク検出を含むテスト
 ```
