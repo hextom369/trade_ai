@@ -1,11 +1,12 @@
 name: Paper trading
 
-# Runs one paper-trading cycle shortly after every 4h candle closes
-# (00/04/08/12/16/20 UTC). The paper account and decision log live on the
-# `paper-state` branch, so main's history stays clean.
+# Acts once per closed 4h candle (00/04/08/12/16/20 UTC). GitHub often delays or
+# drops scheduled runs, so this runs hourly and --skip-processed-bars turns the
+# extra runs into no-ops: any run that does fire catches up on the latest bar.
+# The paper account and decision log live on the `paper-state` branch.
 on:
   schedule:
-    - cron: "7 0,4,8,12,16,20 * * *"
+    - cron: "7 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -53,7 +54,7 @@ jobs:
           --strategy breakout --band 0.1 --target-vol 0.4
           --cost-bps 0 --slippage-bps 3
           --paper-equity 10000 --max-daily-loss 0.10
-          --execute --once --state-dir state/trade_state
+          --skip-processed-bars --execute --once --state-dir state/trade_state
 
       - name: Report
         if: always()

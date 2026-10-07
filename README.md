@@ -187,7 +187,7 @@ Variational 以外の API がある DEX/CEX も同じ形でアダプタを追加
 
 ### GitHub Actions でペーパートレード（PC 不要）
 
-`.github/workflows/paper-trade.yml` が 4 時間足の確定直後（UTC 0/4/8/12/16/20 時の 7 分）に 1 サイクルずつ実行します。
+`.github/workflows/paper-trade.yml` が 4 時間足 1 本につき 1 回判断します。GitHub の予約実行は遅延・欠落が多いため毎時 7 分に起動し、`--skip-processed-bars` で処理済みの足は何もしないので、どれか 1 回でも動けばその足の判断が行われます。
 
 - 戦略：BTC 4 時間足ブレイクアウト（`--band 0.1`、目標ボラ 40%、最大 1 倍、手数料 0・スリッページ 3bps、初期資金 10,000）
 - データ：Binance の公開データホスト（`--market spot`）。GitHub の実行環境は米国にあり、先物 API（fapi.binance.com）は米国から使えないため

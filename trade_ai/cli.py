@@ -294,6 +294,9 @@ def main(argv: list[str] | None = None) -> int:
     tr.add_argument("--min-trade-notional", type=float, default=10.0)
     tr.add_argument("--rebalance-band", type=float, default=0.05)
     tr.add_argument("--max-daily-loss", type=float, default=0.05)
+    tr.add_argument("--skip-processed-bars", action="store_true",
+                    help="do nothing if the latest closed bar was already handled "
+                         "(lets a scheduler run more often than the bar interval)")
     rp = sub.add_parser("report", help="summarize a paper/live trading state directory")
     rp.add_argument("--state-dir", default="trade_state")
     rp.add_argument("--paper-equity", type=float, default=10_000.0)
@@ -406,7 +409,8 @@ def _trade(args, cfg: PipelineConfig) -> int:
         risk=RiskLimits(max_abs_position=args.max_position, max_notional=args.max_notional,
                         min_trade_notional=args.min_trade_notional,
                         rebalance_band=args.rebalance_band, max_daily_loss=args.max_daily_loss),
-        dry_run=not args.execute, state_dir=args.state_dir, top_n=top_n))
+        dry_run=not args.execute, state_dir=args.state_dir, top_n=top_n,
+        skip_processed_bars=args.skip_processed_bars))
     try:
         run_loop(trader, load, once=args.once)
     except NotImplementedError as exc:

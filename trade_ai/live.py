@@ -50,6 +50,7 @@ class TraderConfig:
     dry_run: bool = True
     state_dir: str = "trade_state"
     top_n: int = 1                     # equity slices when trading a universe
+    skip_processed_bars: bool = False  # act once per closed bar even if run more often
 
 
 def _now() -> pd.Timestamp:
@@ -113,6 +114,11 @@ class Trader:
             return self._record({"symbol": sym, "action": "skip",
                                  "reason": f"stale data: last bar closed {age} ago"})
 
+        bar_label = str(df.index[-1])
+        processed = self.risk_state.setdefault("processed_bars", {})
+        if cfg.skip_processed_bars and processed.get(sym) == bar_label:
+            return {"symbol": sym, "action": "already_processed", "bar": bar_label}
+
         sig = latest_target(df, cfg.strategy, cfg.pipeline, cfg.rules)
         target_frac = max(-risk.max_abs_position, min(risk.max_abs_position, sig["target_position"]))
         target_frac *= weight
@@ -136,7 +142,10 @@ class Trader:
 
         notional = abs(delta) * price
         flattening = target_qty == 0 and current != 0
-        return self._execute(sym, delta, notional, equity, flattening, base)
+        decision = self._execute(sym, delta, notional, equity, flattening, base)
+        processed[sym] = bar_label
+        self._save_risk()
+        return decision
 
     def _execute(self, sym: str, delta: float, notional: float, equity: float,
                  flattening: bool, base: dict) -> dict:
