@@ -7,9 +7,6 @@ on:
   schedule:
     - cron: "7 0,4,8,12,16,20 * * *"
   workflow_dispatch:
-  push:
-    branches: [ccr-50fa23a7-rlb0yo]
-    paths: [.github/workflows/paper-trade.yml]
 
 permissions:
   contents: write
@@ -26,9 +23,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
