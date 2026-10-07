@@ -5,18 +5,30 @@ Examples:
     python -m trade_ai backtest --csv prices.csv --long-only
     python -m trade_ai backtest --ticker SPY --start 2010-01-01
     python -m trade_ai signal --ticker 7203.T
+
+Crypto perps (Binance futures candles + funding, Variational-ready):
+    python -m trade_ai backtest --binance BTCUSDT --interval 1h --start 2024-01-01 --strategy breakout
+    python -m trade_ai trade --binance BTCUSDT --venue-symbol BTC --strategy ma_cross --once
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import logging
+import os
 
+from .brokers import PaperBroker
+from .crypto_data import (funding_per_bar, interval_to_timedelta, load_binance_funding,
+                          load_binance_klines, periods_per_year)
 from .data import load_csv, load_yfinance, synthetic_ohlcv
+from .live import RiskLimits, Trader, TraderConfig, run_loop
 from .metrics import format_summary
 from .model import WalkForwardConfig
-from .pipeline import PipelineConfig, latest_signal, run_pipeline
+from .pipeline import PipelineConfig, latest_target, run_pipeline, run_rule_pipeline
+from .rules import RULES, RuleConfig
 from .strategy import StrategyConfig
+from .variational import VariationalBroker, VariationalPublicClient
 
 
 def _add_common(p: argparse.ArgumentParser) -> None:
@@ -24,8 +36,21 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     src.add_argument("--csv", help="CSV file with date, open, high, low, close, volume")
     src.add_argument("--ticker", help="download via yfinance")
     src.add_argument("--synthetic", action="store_true", help="use generated demo data")
+    src.add_argument("--binance", metavar="SYMBOL",
+                     help="Binance USDT-M perpetual candles, e.g. BTCUSDT")
+    p.add_argument("--interval", default="1h", help="candle interval for --binance (1m..1w)")
+    p.add_argument("--no-funding", action="store_true",
+                   help="ignore perp funding in the backtest (--binance only)")
     p.add_argument("--start")
     p.add_argument("--end")
+    p.add_argument("--strategy", choices=["ml", *RULES], default="ml")
+    p.add_argument("--fast", type=int, default=20, help="ma_cross fast MA")
+    p.add_argument("--slow", type=int, default=100, help="ma_cross slow MA")
+    p.add_argument("--breakout-window", type=int, default=55)
+    p.add_argument("--exit-window", type=int, default=20)
+    p.add_argument("--rsi-window", type=int, default=14)
+    p.add_argument("--rsi-low", type=float, default=30.0)
+    p.add_argument("--rsi-high", type=float, default=70.0)
     p.add_argument("--horizon", type=int, default=5)
     p.add_argument("--label-threshold", type=float, default=0.0,
                    help="label threshold in units of horizon volatility")
@@ -43,11 +68,14 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--gate-window", type=int, default=120)
     p.add_argument("--cost-bps", type=float, default=5.0)
     p.add_argument("--slippage-bps", type=float, default=2.0)
-    p.add_argument("--periods-per-year", type=int, default=252)
+    p.add_argument("--periods-per-year", type=int, default=None,
+                   help="default: 252, or 24/7 bars per year for --binance")
 
 
 def _load(args):
-    if args.csv:
+    if args.binance:
+        df = load_binance_klines(args.binance, args.interval, args.start, args.end)
+    elif args.csv:
         df = load_csv(args.csv)
     elif args.ticker:
         df = load_yfinance(args.ticker, args.start, args.end)
@@ -60,7 +88,24 @@ def _load(args):
     return df
 
 
+def _funding(args, df):
+    if not args.binance or args.no_funding:
+        return None
+    events = load_binance_funding(args.binance, start=df.index[0],
+                                  end=df.index[-1] + interval_to_timedelta(args.interval))
+    return funding_per_bar(events, df.index, interval_to_timedelta(args.interval))
+
+
+def _rules(args) -> RuleConfig:
+    return RuleConfig(fast=args.fast, slow=args.slow, breakout_window=args.breakout_window,
+                      exit_window=args.exit_window, rsi_window=args.rsi_window,
+                      rsi_low=args.rsi_low, rsi_high=args.rsi_high)
+
+
 def _config(args) -> PipelineConfig:
+    ppy = args.periods_per_year
+    if ppy is None:
+        ppy = periods_per_year(args.interval) if args.binance else 252
     return PipelineConfig(
         label_threshold=args.label_threshold,
         walk_forward=WalkForwardConfig(
@@ -71,7 +116,7 @@ def _config(args) -> PipelineConfig:
             entry_band=args.entry_band, full_edge=args.full_edge, long_only=args.long_only, target_vol=args.target_vol,
             max_leverage=args.max_leverage, smoothing=args.smoothing,
             quality_gate=not args.no_gate, gate_window=args.gate_window,
-            periods_per_year=args.periods_per_year,
+            periods_per_year=ppy,
         ),
         cost_bps=args.cost_bps, slippage_bps=args.slippage_bps,
     )
@@ -85,12 +130,35 @@ def main(argv: list[str] | None = None) -> int:
     bt.add_argument("--output", help="write per-bar results to this CSV")
     sig = sub.add_parser("signal", help="target position for the next bar")
     _add_common(sig)
+    tr = sub.add_parser("trade", help="run the strategy live / on paper (dry run by default)")
+    _add_common(tr)
+    tr.add_argument("--venue-symbol", help="symbol at the venue (default: --binance without USDT)")
+    tr.add_argument("--broker", choices=["paper", "variational"], default="paper")
+    tr.add_argument("--paper-prices", choices=["candles", "variational"], default="candles",
+                    help="paper broker reference price: last candle close or Variational mark")
+    tr.add_argument("--paper-equity", type=float, default=10_000.0)
+    tr.add_argument("--execute", action="store_true",
+                    help="actually send orders (paper fills for --broker paper); default logs only")
+    tr.add_argument("--once", action="store_true", help="run a single cycle and exit")
+    tr.add_argument("--lookback", type=int, default=1500, help="candles loaded per cycle")
+    tr.add_argument("--state-dir", default="trade_state")
+    tr.add_argument("--max-position", type=float, default=1.0)
+    tr.add_argument("--max-notional", type=float, default=None)
+    tr.add_argument("--min-trade-notional", type=float, default=10.0)
+    tr.add_argument("--rebalance-band", type=float, default=0.05)
+    tr.add_argument("--max-daily-loss", type=float, default=0.05)
     args = parser.parse_args(argv)
 
-    df = _load(args)
     cfg = _config(args)
+    if args.command == "trade":
+        return _trade(args, cfg)
+    df = _load(args)
     if args.command == "backtest":
-        res = run_pipeline(df, cfg)
+        funding = _funding(args, df)
+        if args.strategy == "ml":
+            res = run_pipeline(df, cfg, funding)
+        else:
+            res = run_rule_pipeline(df, args.strategy, _rules(args), cfg, funding)
         b = res.backtest
         print(f"Out-of-sample period: {b.returns.index[0]} -> {b.returns.index[-1]}")
         print("\nStrategy")
@@ -104,7 +172,42 @@ def main(argv: list[str] | None = None) -> int:
             out.to_csv(args.output)
             print(f"\nwrote {args.output}")
     else:
-        print(json.dumps(latest_signal(df, cfg), indent=2))
+        print(json.dumps(latest_target(df, args.strategy, cfg, _rules(args)), indent=2))
+    return 0
+
+
+def _trade(args, cfg: PipelineConfig) -> int:
+    if not args.binance:
+        raise SystemExit("trade needs --binance SYMBOL as its candle source")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    venue = args.venue_symbol or args.binance.upper().removesuffix("USDT")
+    latest: dict = {}
+
+    def load():
+        df = load_binance_klines(args.binance, args.interval, limit=args.lookback)
+        latest["close"] = float(df["close"].iloc[-1])
+        return df
+
+    if args.broker == "variational":
+        broker = VariationalBroker()
+    else:
+        source = (VariationalPublicClient().mark_price if args.paper_prices == "variational"
+                  else lambda _sym: latest["close"])
+        os.makedirs(args.state_dir, exist_ok=True)
+        broker = PaperBroker(initial_equity=args.paper_equity, slippage_bps=args.slippage_bps,
+                             fee_bps=args.cost_bps, price_source=source,
+                             state_path=os.path.join(args.state_dir, "paper_account.json"))
+    trader = Trader(broker, TraderConfig(
+        data_symbol=args.binance, venue_symbol=venue, interval=args.interval,
+        strategy=args.strategy, pipeline=cfg, rules=_rules(args),
+        risk=RiskLimits(max_abs_position=args.max_position, max_notional=args.max_notional,
+                        min_trade_notional=args.min_trade_notional,
+                        rebalance_band=args.rebalance_band, max_daily_loss=args.max_daily_loss),
+        dry_run=not args.execute, state_dir=args.state_dir))
+    try:
+        run_loop(trader, load, once=args.once)
+    except NotImplementedError as exc:
+        raise SystemExit(str(exc)) from None
     return 0
 
 

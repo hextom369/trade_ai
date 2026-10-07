@@ -72,7 +72,67 @@ python -m trade_ai signal --ticker SPY
 | `--long-only` | off | 売りポジションを取らない |
 | `--no-gate` / `--gate-window` | on / 120 | 品質ゲートの無効化 / 的中率の計算期間 |
 | `--cost-bps` / `--slippage-bps` | 5 / 2 | 片道コスト (bps) |
-| `--periods-per-year` | 252 | 日足以外（例: 時間足）の年率換算に使用 |
+| `--periods-per-year` | 252（`--binance` は自動） | 日足以外（例: 時間足）の年率換算に使用 |
+
+## 暗号資産パーペチュアル / Variational での自動売買
+
+AI（`--strategy ml`）とルールベース戦略を同じ枠組みでバックテスト→ペーパー取引→実運用できます。
+
+> ⚠️ **Variational の現状（2026-10 確認）**：公開 API は読み取り専用（`/metadata/stats` のマーク価格・ファンディング等）で、
+> **注文用のトレード API はまだ一般公開されていません**。そのため現在は「Variational のマーク価格でのペーパー取引」まで対応し、
+> 実注文は `trade_ai/variational.py` の `VariationalBroker` が明示的にエラーにします。API 公開後はこのクラスの
+> `equity` / `position` / `market_order` を実装するだけで、戦略・リスク管理・ループはそのまま使えます。
+
+### 戦略
+
+| `--strategy` | 内容 |
+|---|---|
+| `ml` | 既存の ML（ウォークフォワード学習のアンサンブル） |
+| `ma_cross` | 短期MA > 長期MA で買い、逆で売り（`--fast` / `--slow`） |
+| `breakout` | ドンチャン・ブレイクアウト（`--breakout-window` で新値エントリー、`--exit-window` で手仕舞い） |
+| `rsi_reversion` | RSI 逆張り（`--rsi-low` 以下で買い / `--rsi-high` 以上で売り、50 で手仕舞い） |
+
+どの戦略も同じサイジング（ボラ・ターゲティング、上限レバレッジ、`--long-only`、平滑化）を通ります。
+
+### データとバックテスト
+
+価格データは Variational が参照する大手取引所のうち、Binance USDⓈ-M 先物の公開ローソク足を使います（API キー不要）。
+バックテストでは**ファンディング（ロングが支払い、ショートが受け取り）**も損益に反映し、年率換算は 24 時間 365 日で自動計算します。
+
+```bash
+python -m trade_ai backtest --binance BTCUSDT --interval 1h --start 2024-01-01 --strategy breakout
+python -m trade_ai backtest --binance ETHUSDT --interval 4h --start 2023-01-01 --strategy ml --horizon 3
+python -m trade_ai signal   --binance BTCUSDT --interval 1h --strategy ma_cross   # 次の足の目標ポジション
+```
+
+Variational は取引手数料ゼロですが RFQ のスプレッドがかかるため、`--cost-bps 0 --slippage-bps 3` のようにスリッページ側で見積もってください。
+
+### ペーパー取引 / 実運用ループ
+
+```bash
+# 1回だけ判断して記録（注文はしない＝ドライラン）
+python -m trade_ai trade --binance BTCUSDT --strategy ma_cross --once
+
+# ペーパー口座で継続運用（足が確定するたびに判断・約定）。価格は Variational のマーク価格
+python -m trade_ai trade --binance BTCUSDT --venue-symbol BTC --strategy breakout \
+    --execute --paper-prices variational --paper-equity 10000 --cost-bps 0 --slippage-bps 3
+```
+
+- 判断はすべて `trade_state/decisions.jsonl` に、ペーパー口座は `trade_state/paper_account.json` に保存（再起動しても継続）
+- `--execute` を付けない限り注文しません（ドライラン）
+
+安全装置:
+
+| オプション | 既定値 | 内容 |
+|---|---|---|
+| `--max-position` | 1.0 | 目標ポジションの絶対上限（資金比） |
+| `--max-notional` | なし | 建玉の名目金額の上限 |
+| `--max-daily-loss` | 0.05 | UTC の1日で資金が 5% 減ったら全決済し、その日は停止 |
+| `--rebalance-band` / `--min-trade-notional` | 0.05 / 10 | 小さな調整は発注しない（無駄な売買を防止） |
+| （自動） | | 最新の確定足が古すぎる場合は取引しない／通信エラーは記録して次の足で再試行、5 連続で停止 |
+
+Python からは `trade_ai.live.Trader` に任意の `Broker`（`trade_ai.brokers.Broker` を継承）を渡せます。
+Variational 以外の API がある DEX/CEX も同じ形でアダプタを追加すれば動きます。
 
 ## Python から使う
 
@@ -96,7 +156,12 @@ trade_ai/
   strategy.py   確率→ポジション変換、ボラターゲット、品質ゲート
   backtest.py   コスト込みバックテスト
   metrics.py    シャープ, ソルティノ, 最大DD, カルマー, 回転率など
-  pipeline.py   一連の処理と最新シグナル
+  pipeline.py   一連の処理と最新シグナル（ML / ルール共通）
+  rules.py      ルールベース戦略（MAクロス, ブレイクアウト, RSI逆張り）
+  crypto_data.py Binance 先物のローソク足・ファンディング取得
+  brokers.py    取引所インターフェースとペーパー取引
+  variational.py Variational Omni アダプタ（公開データ／トレードAPI待ち）
+  live.py       リスク管理付きの売買ループ
   cli.py        コマンドライン
 tests/          リーク検出を含むテスト
 ```

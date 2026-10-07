@@ -21,12 +21,16 @@ class BacktestResult:
 
 def run_backtest(close: pd.Series, target_positions: pd.Series,
                  cost_bps: float = 5.0, slippage_bps: float = 2.0,
-                 periods_per_year: int = 252) -> BacktestResult:
+                 periods_per_year: int = 252,
+                 funding: pd.Series | None = None) -> BacktestResult:
     """Simulate trading ``target_positions`` decided at each bar's close.
 
     The position chosen at the close of bar t is held over bar t+1, so the
     signal never sees the return it is paid on. Costs are charged on the
     absolute change in position, in basis points of notional.
+
+    ``funding`` (perpetual futures) is the funding rate settled during each bar,
+    as a fraction of notional; longs pay positive funding and shorts receive it.
     """
     target_positions = target_positions.reindex(close.index).fillna(0.0)
     asset_ret = close.pct_change().fillna(0.0)
@@ -34,6 +38,8 @@ def run_backtest(close: pd.Series, target_positions: pd.Series,
     turnover = held.diff().abs().fillna(held.abs())
     cost = turnover * (cost_bps + slippage_bps) / 1e4
     net = held * asset_ret - cost
+    if funding is not None:
+        net = net - held * funding.reindex(close.index).fillna(0.0)
     equity = (1 + net).cumprod()
     return BacktestResult(
         returns=net.rename("strategy"),

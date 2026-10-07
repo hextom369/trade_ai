@@ -39,6 +39,17 @@ def positions_from_proba(proba: pd.Series, close: pd.Series,
     span = max(cfg.full_edge - band, 1e-9)
     conviction = np.sign(edge) * ((edge.abs() - band) / span).clip(0, 1)
     conviction = conviction.fillna(0.0)
+    return size_positions(conviction, close, cfg)
+
+
+def size_positions(conviction: pd.Series, close: pd.Series,
+                   cfg: StrategyConfig | None = None) -> pd.Series:
+    """Turn a conviction in [-1, 1] into a position with smoothing and vol targeting.
+
+    Shared by the ML strategy and the rule-based strategies.
+    """
+    cfg = cfg or StrategyConfig()
+    conviction = conviction.reindex(close.index).fillna(0.0).clip(-1, 1)
     if cfg.long_only:
         conviction = conviction.clip(lower=0)
     if cfg.smoothing and cfg.smoothing > 1:
