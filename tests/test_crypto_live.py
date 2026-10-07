@@ -291,3 +291,20 @@ def test_run_once_raises_after_logging_error(tmp_path):
         run_loop(t, broken, once=True)
     last = json.loads((tmp_path / "decisions.jsonl").read_text().splitlines()[-1])
     assert last["action"] == "error"
+
+
+def test_skip_processed_bars_acts_once_per_bar(tmp_path):
+    df = hourly()
+    broker = PaperBroker(10_000, slippage_bps=0)
+    broker.set_price("BTC", float(df["close"].iloc[-1]))
+    t = _trader(tmp_path, broker, df)
+    t.cfg.skip_processed_bars = True
+    first = t.step(df)
+    assert first["action"] in ("order", "hold")
+    assert t.step(df)["action"] == "already_processed"
+    # Survives a restart (state on disk), and a new bar is handled again.
+    t2 = _trader(tmp_path, broker, df)
+    t2.cfg.skip_processed_bars = True
+    assert t2.step(df)["action"] == "already_processed"
+    lines = (tmp_path / "decisions.jsonl").read_text().splitlines()
+    assert len(lines) == 1
