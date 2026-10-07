@@ -10,6 +10,8 @@ import numpy as np
 import pandas as pd
 
 REQUIRED_COLUMNS = ["open", "high", "low", "close", "volume"]
+# Kept when present: base volume bought by takers (market buys), e.g. from Binance.
+OPTIONAL_COLUMNS = ["taker_buy_volume"]
 
 
 def _normalize(df: pd.DataFrame) -> pd.DataFrame:
@@ -20,7 +22,7 @@ def _normalize(df: pd.DataFrame) -> pd.DataFrame:
     missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
     if missing:
         raise ValueError(f"missing columns: {missing}")
-    df = df[REQUIRED_COLUMNS].astype(float)
+    df = df[REQUIRED_COLUMNS + [c for c in OPTIONAL_COLUMNS if c in df.columns]].astype(float)
     df = df[~df.index.duplicated(keep="last")].sort_index()
     df = df.dropna(subset=["close"])
     df["volume"] = df["volume"].fillna(0.0)

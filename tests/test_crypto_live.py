@@ -12,7 +12,8 @@ from trade_ai.crypto_data import (funding_per_bar, load_binance_funding, load_bi
 from trade_ai.data import synthetic_ohlcv
 from trade_ai.live import RiskLimits, Trader, TraderConfig
 from trade_ai.pipeline import PipelineConfig, run_rule_pipeline
-from trade_ai.rules import RULES, RuleConfig, breakout, rule_signal
+from trade_ai.features import build_features
+from trade_ai.rules import RULES, RuleConfig, breakout, rule_signal, taker_flow, volume_breakout, vwap_obv
 from trade_ai.variational import VariationalBroker, VariationalPublicClient
 
 HOUR_MS = 3_600_000
@@ -21,6 +22,9 @@ HOUR_MS = 3_600_000
 def hourly(n=600, seed=2):
     df = synthetic_ohlcv(n=n, seed=seed, regime_strength=0.3)
     df.index = pd.date_range("2026-01-01", periods=n, freq="h", name="date")
+    # Takers lean toward the bar's direction, like real order flow.
+    share = 0.5 + 0.3 * np.tanh(np.log(df["close"] / df["open"]) * 50)
+    df["taker_buy_volume"] = df["volume"] * share
     return df
 
 
@@ -41,6 +45,53 @@ def test_breakout_enters_and_exits():
     df = pd.DataFrame({"close": close, "high": close, "low": close})
     sig = breakout(df, window=5, exit_window=2)
     assert list(sig) == [0, 0, 0, 0, 0, 0, 1, 1, 0, -1]
+
+
+def test_volume_breakout_needs_heavy_volume():
+    close = [10.0] * 6 + [12.0, 12.5]
+    base = pd.DataFrame({"close": close, "high": close, "low": close})
+    thin = base.assign(volume=[100.0] * 8)
+    heavy = base.assign(volume=[100.0] * 6 + [300.0, 100.0])
+    assert volume_breakout(thin, window=5, exit_window=2, vol_window=3).max() == 0
+    assert list(volume_breakout(heavy, window=5, exit_window=2, vol_window=3)) == \
+        [0, 0, 0, 0, 0, 0, 1, 1]
+
+
+def test_vwap_obv_needs_price_and_volume_to_agree():
+    n = 60
+    close = pd.Series(np.linspace(100, 130, n))
+    df = pd.DataFrame({"close": close, "high": close + 1, "low": close - 1,
+                       "volume": 1000.0})
+    assert vwap_obv(df, window=10).iloc[-1] == 1.0          # rising price, buying volume
+    # Same price path, but heavy volume only on the (few) down bars -> OBV falls.
+    choppy = close.copy()
+    choppy.iloc[1::5] -= 1.5
+    df2 = pd.DataFrame({"close": choppy, "high": choppy + 1, "low": choppy - 1})
+    df2["volume"] = np.where(choppy.diff() < 0, 10_000.0, 100.0)
+    assert vwap_obv(df2, window=10).iloc[-1] == 0.0
+
+
+def test_taker_flow_follows_aggressive_buyers():
+    df = hourly(200)
+    df["taker_buy_volume"] = df["volume"] * 0.6
+    assert (taker_flow(df).iloc[20:] == 1).all()
+    df["taker_buy_volume"] = df["volume"] * 0.4
+    assert (taker_flow(df).iloc[20:] == -1).all()
+    with pytest.raises(ValueError):
+        taker_flow(df.drop(columns="taker_buy_volume"))
+
+
+def test_volume_features_do_not_look_ahead():
+    df = hourly()
+    cut = 400
+    tampered = df.copy()
+    tampered.iloc[cut + 1:] *= 2.0
+    tampered.iloc[cut + 1:, tampered.columns.get_loc("taker_buy_volume")] *= 0.3
+    a, b = build_features(df), build_features(tampered)
+    assert {"obv_slope_10", "vwap_dist_20", "cmf_20", "mfi_14", "taker_buy_5"} <= set(a.columns)
+    pd.testing.assert_frame_equal(a.iloc[:cut + 1], b.iloc[:cut + 1])
+    base = build_features(df, volume_features=False)
+    assert "obv_slope_10" not in base.columns and "ret_1" in base.columns
 
 
 def test_rule_pipeline_runs_after_warmup():
@@ -74,7 +125,7 @@ def test_periods_per_year():
 
 def _kline(open_ms, price=100.0):
     return [open_ms, str(price), str(price + 1), str(price - 1), str(price), "5",
-            open_ms + HOUR_MS - 1, "0", 0, "0", "0", "0"]
+            open_ms + HOUR_MS - 1, "0", 0, "3", "0", "0"]
 
 
 def test_binance_klines_paginate_and_drop_open_candle():
@@ -93,6 +144,7 @@ def test_binance_klines_paginate_and_drop_open_candle():
     assert len(df) == 6 and len(calls) == 3
     assert calls[0]["symbol"] == "BTCUSDT"
     assert df.index[0] == pd.Timestamp("2026-01-01") and df["close"].iloc[-1] == 105.0
+    assert "taker_buy_volume" in df.columns
 
 
 def test_binance_funding_parses():

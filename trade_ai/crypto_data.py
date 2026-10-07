@@ -89,8 +89,9 @@ def load_binance_klines(symbol: str, interval: str = "1h", start: str | None = N
     rows = [r for r in rows if int(r[6]) < now_ms]  # drop the still-forming candle
     if not rows:
         raise ValueError(f"no candles returned for {symbol} {interval}")
-    df = pd.DataFrame([r[:6] for r in rows],
-                      columns=["open_time", "open", "high", "low", "close", "volume"])
+    df = pd.DataFrame([[*r[:6], r[9]] for r in rows],
+                      columns=["open_time", "open", "high", "low", "close", "volume",
+                               "taker_buy_volume"])
     df.index = pd.to_datetime(df.pop("open_time").astype("int64"), unit="ms")
     df.index.name = "date"
     return _normalize(df)

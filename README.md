@@ -92,7 +92,24 @@ AI（`--strategy ml`）とルールベース戦略を同じ枠組みでバック
 | `breakout` | ドンチャン・ブレイクアウト（`--breakout-window` で新値エントリー、`--exit-window` で手仕舞い） |
 | `rsi_reversion` | RSI 逆張り（`--rsi-low` 以下で買い / `--rsi-high` 以上で売り、50 で手仕舞い） |
 
+| `volume_breakout` | **出来高を伴うブレイクアウトだけ**エントリー（ブレイク足の出来高が直前 `--vol-window` 本平均の `--vol-mult` 倍以上） |
+| `vwap_obv` | **価格と出来高が一致した時だけ**取引：VWAP より上かつ OBV（出来高の買い越し）が増加でロング、逆でショート、食い違えばノーポジ |
+| `taker_flow` | **テイカー買い比率**（成行買い ÷ 出来高）の EMA が 0.5±`--taker-band` を超えた方向に追随。`--binance` データが必要 |
+
 どの戦略も同じサイジング（ボラ・ターゲティング、上限レバレッジ、`--long-only`、平滑化）を通ります。
+
+### 出来高の活用
+
+- **ML の特徴量**に出来高系を追加しています：相対出来高、OBV の傾き、VWAP 乖離、CMF（チャイキン・マネーフロー）、MFI、価格変化と出来高変化の相関、出来高で重み付けしたリターン、テイカー買い比率（1/5/20 本）。
+- 出来高は Binance 先物の出来高（市場全体の流動性）を使います。Variational は RFQ 方式なので足ごとの自前の出来高はありません。
+- **出来高が本当に効いているか**は銘柄・時間足で変わるので、必ず比較してください：
+
+```bash
+python -m trade_ai backtest --binance BTCUSDT --interval 1h --start 2024-01-01 --strategy ml --horizon 3
+python -m trade_ai backtest --binance BTCUSDT --interval 1h --start 2024-01-01 --strategy ml --horizon 3 --no-volume-features
+```
+
+  （合成データでは出来高がノイズなので、出来高特徴量を外した方が成績が良くなります。効かない特徴量はむしろ害になる例です。）
 
 ### データとバックテスト
 

@@ -51,9 +51,18 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--rsi-window", type=int, default=14)
     p.add_argument("--rsi-low", type=float, default=30.0)
     p.add_argument("--rsi-high", type=float, default=70.0)
+    p.add_argument("--vol-window", type=int, default=20, help="volume_breakout avg volume window")
+    p.add_argument("--vol-mult", type=float, default=2.0,
+                   help="volume_breakout: required volume vs average")
+    p.add_argument("--vwap-window", type=int, default=48, help="vwap_obv lookback")
+    p.add_argument("--obv-min", type=float, default=0.1, help="vwap_obv min net volume share")
+    p.add_argument("--taker-span", type=int, default=12, help="taker_flow EMA span")
+    p.add_argument("--taker-band", type=float, default=0.02, help="taker_flow no-trade band")
     p.add_argument("--horizon", type=int, default=5)
     p.add_argument("--label-threshold", type=float, default=0.0,
                    help="label threshold in units of horizon volatility")
+    p.add_argument("--no-volume-features", action="store_true",
+                   help="ml: drop volume/order-flow features (to measure what volume adds)")
     p.add_argument("--model", choices=["ensemble", "hgb", "logreg"], default="ensemble")
     p.add_argument("--min-train", type=int, default=500)
     p.add_argument("--retrain-every", type=int, default=60)
@@ -99,7 +108,10 @@ def _funding(args, df):
 def _rules(args) -> RuleConfig:
     return RuleConfig(fast=args.fast, slow=args.slow, breakout_window=args.breakout_window,
                       exit_window=args.exit_window, rsi_window=args.rsi_window,
-                      rsi_low=args.rsi_low, rsi_high=args.rsi_high)
+                      rsi_low=args.rsi_low, rsi_high=args.rsi_high,
+                      vol_window=args.vol_window, vol_mult=args.vol_mult,
+                      vwap_window=args.vwap_window, obv_min=args.obv_min,
+                      taker_span=args.taker_span, taker_band=args.taker_band)
 
 
 def _config(args) -> PipelineConfig:
@@ -108,6 +120,7 @@ def _config(args) -> PipelineConfig:
         ppy = periods_per_year(args.interval) if args.binance else 252
     return PipelineConfig(
         label_threshold=args.label_threshold,
+        volume_features=not args.no_volume_features,
         walk_forward=WalkForwardConfig(
             horizon=args.horizon, min_train=args.min_train, retrain_every=args.retrain_every,
             train_window=args.train_window, model=args.model,

@@ -16,6 +16,7 @@ from .strategy import StrategyConfig, positions_from_proba, quality_gate
 @dataclass
 class PipelineConfig:
     label_threshold: float = 0.0
+    volume_features: bool = True
     walk_forward: WalkForwardConfig = field(default_factory=WalkForwardConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     cost_bps: float = 5.0
@@ -31,7 +32,7 @@ class PipelineResult:
 
 
 def _prepare(df: pd.DataFrame, cfg: PipelineConfig):
-    features = build_features(df)
+    features = build_features(df, cfg.volume_features)
     labels = make_labels(df, horizon=cfg.walk_forward.horizon, threshold=cfg.label_threshold)
     return features, labels
 
@@ -59,7 +60,10 @@ def run_pipeline(df: pd.DataFrame, cfg: PipelineConfig | None = None,
 def rule_warmup(rule: str, rule_cfg: RuleConfig, cfg: PipelineConfig) -> int:
     """Bars needed before the rule (and the vol-target estimate) is fully formed."""
     need = {"ma_cross": rule_cfg.slow, "breakout": rule_cfg.breakout_window + 1,
-            "rsi_reversion": rule_cfg.rsi_window * 5}.get(rule, 0)
+            "rsi_reversion": rule_cfg.rsi_window * 5,
+            "volume_breakout": max(rule_cfg.breakout_window, rule_cfg.vol_window) + 1,
+            "vwap_obv": rule_cfg.vwap_window + 1,
+            "taker_flow": rule_cfg.taker_span * 3}.get(rule, 0)
     return max(need, cfg.strategy.vol_window + 1)
 
 
